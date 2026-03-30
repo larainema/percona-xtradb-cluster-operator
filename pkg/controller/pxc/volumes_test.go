@@ -69,6 +69,49 @@ func TestReconcilePersistentVolumesVolumeExternalAutoscaling(t *testing.T) {
 		},
 	}
 
+	cr := &pxcv1.PerconaXtraDBCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      clusterName,
+			Namespace: namespace,
+		},
+		Spec: pxcv1.PerconaXtraDBClusterSpec{
+			PXC: &pxcv1.PXCSpec{
+				PodSpec: &pxcv1.PodSpec{
+					Size: 1,
+					VolumeSpec: &pxcv1.VolumeSpec{
+						PersistentVolumeClaim: &corev1.PersistentVolumeClaimSpec{
+							Resources: corev1.VolumeResourceRequirements{
+								Requests: corev1.ResourceList{
+									corev1.ResourceStorage: resource.MustParse(requestedSize),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "datadir-test-cluster-pxc-0",
+			Namespace: namespace,
+			Labels:    labels,
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: resource.MustParse(configuredSize),
+				},
+			},
+		},
+		Status: corev1.PersistentVolumeClaimStatus{
+			Capacity: corev1.ResourceList{
+				corev1.ResourceStorage: resource.MustParse(configuredSize),
+			},
+		},
+	}
+
 	tests := map[string]struct {
 		volumeExternalAutoscaling bool
 		volumeExpansionEnabled    bool
@@ -110,50 +153,8 @@ func TestReconcilePersistentVolumesVolumeExternalAutoscaling(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			ctx := t.Context()
 
-			pvc := &corev1.PersistentVolumeClaim{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "datadir-test-cluster-pxc-0",
-					Namespace: namespace,
-					Labels:    labels,
-				},
-				Spec: corev1.PersistentVolumeClaimSpec{
-					Resources: corev1.VolumeResourceRequirements{
-						Requests: corev1.ResourceList{
-							corev1.ResourceStorage: resource.MustParse(configuredSize),
-						},
-					},
-				},
-				Status: corev1.PersistentVolumeClaimStatus{
-					Capacity: corev1.ResourceList{
-						corev1.ResourceStorage: resource.MustParse(configuredSize),
-					},
-				},
-			}
-
-			cr := &pxcv1.PerconaXtraDBCluster{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      clusterName,
-					Namespace: namespace,
-				},
-				Spec: pxcv1.PerconaXtraDBClusterSpec{
-					VolumeExternalAutoscaling: tt.volumeExternalAutoscaling,
-					VolumeExpansionEnabled:    tt.volumeExpansionEnabled,
-					PXC: &pxcv1.PXCSpec{
-						PodSpec: &pxcv1.PodSpec{
-							Size: 1,
-							VolumeSpec: &pxcv1.VolumeSpec{
-								PersistentVolumeClaim: &corev1.PersistentVolumeClaimSpec{
-									Resources: corev1.VolumeResourceRequirements{
-										Requests: corev1.ResourceList{
-											corev1.ResourceStorage: resource.MustParse(requestedSize),
-										},
-									},
-								},
-							},
-						},
-					},
-				},
-			}
+			cr := cr.DeepCopy()
+			pvc := pvc.DeepCopy()
 
 			cr.Spec.VolumeExternalAutoscaling = tt.volumeExternalAutoscaling
 			cr.Spec.VolumeExpansionEnabled = tt.volumeExpansionEnabled
