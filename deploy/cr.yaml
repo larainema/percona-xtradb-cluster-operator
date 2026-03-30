@@ -11,7 +11,8 @@ metadata:
 #    percona.com/issue-vault-token: "true"
 spec:
   crVersion: 1.20.0
-#  enableVolumeExpansion: false
+  enableVolumeExpansion: false
+#  enableExternalAutoscaling: false
 #  ignoreAnnotations:
 #    - iam.amazonaws.com/role
 #  ignoreLabels:
@@ -203,7 +204,7 @@ spec:
 #          apiGroup: snapshot.storage.k8s.io
         resources:
           requests:
-            storage: 6G
+            storage: 3G
     gracePeriod: 600
 #    lifecycle:
 #      preStop:

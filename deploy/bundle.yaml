@@ -12533,7 +12533,7 @@ spec:
           value: "1"
         - name: PXCO_FEATURE_GATES
           value: ""
-        image: perconalab/percona-xtradb-cluster-operator:main
+        image: ademajazzserve/percona-xtradb-cluster-operator:K8SPXC-1685-1
         imagePullPolicy: Always
         livenessProbe:
           failureThreshold: 3
