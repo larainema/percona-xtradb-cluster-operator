@@ -2464,6 +2464,8 @@ spec:
                 type: string
               enableCRValidationWebhook:
                 type: boolean
+              enableExternalAutoscaling:
+                type: boolean
               enableVolumeExpansion:
                 type: boolean
               haproxy:
@@ -12533,7 +12535,7 @@ spec:
           value: "1"
         - name: PXCO_FEATURE_GATES
           value: ""
-        image: ademajazzserve/percona-xtradb-cluster-operator:K8SPXC-1685-1
+        image: perconalab/percona-xtradb-cluster-operator:main
         imagePullPolicy: Always
         livenessProbe:
           failureThreshold: 3
