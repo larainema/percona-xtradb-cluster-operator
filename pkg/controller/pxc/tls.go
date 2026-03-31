@@ -1,6 +1,7 @@
 package pxc
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"time"
@@ -13,6 +14,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	api "github.com/percona/percona-xtradb-cluster-operator/pkg/apis/pxc/v1"
 	"github.com/percona/percona-xtradb-cluster-operator/pkg/k8s"
@@ -46,6 +48,9 @@ func (r *ReconcilePerconaXtraDBCluster) reconcileSSL(ctx context.Context, cr *ap
 		&secretInternalObj,
 	)
 	if errSecret == nil && errInternalSecret == nil {
+		if err := r.reconcileCARotation(ctx, cr, &secretObj, &secretInternalObj); err != nil {
+			return errors.Wrap(err, "reconcile CA rotation")
+		}
 		return nil
 	} else if errSecret != nil && !k8serr.IsNotFound(errSecret) {
 		return fmt.Errorf("get secret: %v", errSecret)
@@ -347,6 +352,126 @@ func (r *ReconcilePerconaXtraDBCluster) createSSLManualy(ctx context.Context, cr
 	if err != nil && !k8serr.IsAlreadyExists(err) {
 		return fmt.Errorf("create TLS internal secret: %v", err)
 	}
+	return nil
+}
+
+func (r *ReconcilePerconaXtraDBCluster) reconcileCARotation(
+	ctx context.Context,
+	cr *api.PerconaXtraDBCluster,
+	sslSecret *corev1.Secret,
+	sslInternalSecret *corev1.Secret,
+) error {
+	log := logf.FromContext(ctx)
+
+	// Only applies when the operator manages its own CA via cert-manager.
+	if cr.Spec.TLS != nil && cr.Spec.TLS.IssuerConf != nil {
+		return nil
+	}
+
+	// Skip manually created secrets.
+	if sslSecret.Annotations["cert-manager.io/issuer-kind"] == "" {
+		return nil
+	}
+
+	caSecretName := cr.Name + "-ca-cert"
+	caSecret := corev1.Secret{}
+	if err := r.client.Get(ctx, types.NamespacedName{
+		Namespace: cr.Namespace,
+		Name:      caSecretName,
+	}, &caSecret); err != nil {
+		if k8serr.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("get CA secret %s: %w", caSecretName, err)
+	}
+
+	currentCA := caSecret.Data["tls.crt"]
+	if len(currentCA) == 0 {
+		return nil
+	}
+
+	sslMismatch := !bytes.Equal(currentCA, sslSecret.Data["ca.crt"])
+	sslInternalMismatch := !bytes.Equal(currentCA, sslInternalSecret.Data["ca.crt"])
+
+	if !sslMismatch && !sslInternalMismatch {
+		return nil
+	}
+
+	log.Info("CA certificate rotation detected, re-issuing leaf TLS certificates",
+		"cluster", cr.Name,
+		"sslMismatch", sslMismatch,
+		"sslInternalMismatch", sslInternalMismatch,
+	)
+	r.recorder.Event(cr, corev1.EventTypeNormal, "CARotation",
+		"CA certificate rotated, re-issuing leaf TLS certificates")
+
+	// Trigger cert-manager to re-issue leaf certificates by setting the
+	// Issuing condition to True on the Certificate CRs. This is the same
+	// mechanism used by `cmctl renew`. cert-manager will re-issue the leaf
+	// cert using the current CA from the Issuer and update the Secret
+	// in-place, which is safer than deleting the Secret.
+	var certNames []string
+	if sslMismatch {
+		certNames = append(certNames, cr.Name+"-ssl")
+	}
+	if sslInternalMismatch && cr.Spec.PXC.SSLSecretName != cr.Spec.PXC.SSLInternalSecretName {
+		certNames = append(certNames, cr.Name+"-ssl-internal")
+	}
+
+	now := metav1.Now()
+	for _, name := range certNames {
+		cert := &cm.Certificate{}
+		if err := r.client.Get(ctx, types.NamespacedName{
+			Namespace: cr.Namespace,
+			Name:      name,
+		}, cert); err != nil {
+			if k8serr.IsNotFound(err) {
+				continue
+			}
+			return fmt.Errorf("get certificate %s: %w", name, err)
+		}
+
+		// Check if already issuing to avoid redundant status updates.
+		alreadyIssuing := false
+		for _, c := range cert.Status.Conditions {
+			if c.Type == cm.CertificateConditionIssuing && c.Status == cmmeta.ConditionTrue {
+				alreadyIssuing = true
+				break
+			}
+		}
+		if alreadyIssuing {
+			log.Info("Certificate already issuing, skipping", "certificate", name)
+			continue
+		}
+
+		log.Info("Triggering leaf certificate re-issuance", "certificate", name)
+
+		// Set the Issuing condition to True to trigger cert-manager re-issuance.
+		issuing := cm.CertificateCondition{
+			Type:               cm.CertificateConditionIssuing,
+			Status:             cmmeta.ConditionTrue,
+			Reason:             "ManuallyTriggered",
+			Message:            "Re-issuing due to CA rotation",
+			LastTransitionTime: &now,
+		}
+
+		found := false
+		for i, c := range cert.Status.Conditions {
+			if c.Type == cm.CertificateConditionIssuing {
+				cert.Status.Conditions[i] = issuing
+				found = true
+				break
+			}
+		}
+		if !found {
+			cert.Status.Conditions = append(cert.Status.Conditions, issuing)
+		}
+
+		if err := r.client.Status().Update(ctx, cert); err != nil {
+			return fmt.Errorf("update certificate status %s: %w", name, err)
+		}
+	}
+
 	return nil
 }
 
