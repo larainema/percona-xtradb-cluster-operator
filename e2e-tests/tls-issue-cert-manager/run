@@ -39,17 +39,35 @@ main() {
 	desc 'check if certificate issued'
 	compare_kubectl certificate/$cluster-ssl
 
-	apply_config "$test_dir/conf/$cluster-haproxy.yml"
-	wait_for_running "$cluster-haproxy" 1
-	wait_cluster_consistency "$cluster" 3 2
-
 	desc 'check ssl-internal certificate using PXC'
 	check_verify_identity "$cluster-pxc"
 	desc 'check ssl-internal certificate using HAProxy'
 	check_verify_identity "$cluster-haproxy"
+
+	desc 'update tls spec: change duration and add new SAN'
+	apply_config "$test_dir/conf/$cluster-updated.yml"
+	sleep 30
+
+	desc 'check if CA certificate updated'
+	compare_kubectl certificate/$cluster-ca-cert "-updated"
+
+	desc 'check if SSL certificate updated'
+	compare_kubectl certificate/$cluster-ssl "-updated"
+
+	wait_cluster_consistency "$cluster" 3 2
+
+	desc 'check ssl-internal certificate using PXC after update'
+	check_verify_identity "$cluster-pxc"
 
 	destroy $namespace
 	desc "test passed"
 }
 
 main
+kubectl_bin apply -f "$conf_dir/secrets_without_tls.yml"
+	apply_config "$test_dir/conf/client.yml"
+	apply_config "$test_dir/conf/$cluster.yml"
+
+	desc 'wait for cluster to be ready'
+	wait_for_running "$cluster-haproxy" 1
+	wait_for_running "$cluster-pxc" 3
