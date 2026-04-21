@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	cmapiutil "github.com/cert-manager/cert-manager/pkg/api/util"
 	cm "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 	"github.com/pkg/errors"
@@ -75,8 +76,8 @@ func (r *ReconcilePerconaXtraDBCluster) reconcileSSL(ctx context.Context, cr *ap
 }
 
 func (r *ReconcilePerconaXtraDBCluster) createSSLByCertManager(ctx context.Context, cr *api.PerconaXtraDBCluster) error {
-	issuerName := cr.Name + "-pxc-issuer"
-	caIssuerName := cr.Name + "-pxc-ca-issuer"
+	issuerName := naming.IssuerName(cr)
+	caIssuerName := naming.CAIssuerName(cr)
 	issuerKind := "Issuer"
 	issuerGroup := ""
 	caDuration := &metav1.Duration{Duration: pxctls.DefaultCAValidity}
@@ -95,11 +96,11 @@ func (r *ReconcilePerconaXtraDBCluster) createSSLByCertManager(ctx context.Conte
 
 		caCert := &cm.Certificate{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      cr.Name + "-ca-cert",
+				Name:      naming.CACertificateName(cr),
 				Namespace: cr.Namespace,
 			},
 			Spec: cm.CertificateSpec{
-				SecretName: cr.Name + "-ca-cert",
+				SecretName: naming.CACertificateName(cr),
 				CommonName: cr.Name + "-ca",
 				IsCA:       true,
 				IssuerRef: cmmeta.ObjectReference{
@@ -136,7 +137,7 @@ func (r *ReconcilePerconaXtraDBCluster) createSSLByCertManager(ctx context.Conte
 
 	kubeCert := &cm.Certificate{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      cr.Name + "-ssl",
+			Name:      naming.SSLCertificateName(cr),
 			Namespace: cr.Namespace,
 		},
 		Spec: cm.CertificateSpec{
@@ -176,7 +177,7 @@ func (r *ReconcilePerconaXtraDBCluster) createSSLByCertManager(ctx context.Conte
 
 	kubeCert = &cm.Certificate{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      cr.Name + "-ssl-internal",
+			Name:      naming.SSLInternalCertificateName(cr),
 			Namespace: cr.Namespace,
 		},
 		Spec: cm.CertificateSpec{
@@ -373,7 +374,7 @@ func (r *ReconcilePerconaXtraDBCluster) reconcileCARotation(
 		return nil
 	}
 
-	caSecretName := cr.Name + "-ca-cert"
+	caSecretName := naming.CACertificateName(cr)
 	caSecret := corev1.Secret{}
 	if err := r.client.Get(ctx, types.NamespacedName{
 		Namespace: cr.Namespace,
@@ -412,13 +413,17 @@ func (r *ReconcilePerconaXtraDBCluster) reconcileCARotation(
 	// in-place, which is safer than deleting the Secret.
 	var certNames []string
 	if sslMismatch {
-		certNames = append(certNames, cr.Name+"-ssl")
+		certNames = append(certNames, naming.SSLCertificateName(cr))
 	}
+	// Only request re-issuance for the internal certificate if it is a
+	// distinct cert-manager Certificate. When SSLSecretName equals
+	// SSLInternalSecretName the operator manages a single leaf Certificate
+	// that backs both secret references, so the SSLCertificateName entry
+	// above already covers it.
 	if sslInternalMismatch && cr.Spec.PXC.SSLSecretName != cr.Spec.PXC.SSLInternalSecretName {
-		certNames = append(certNames, cr.Name+"-ssl-internal")
+		certNames = append(certNames, naming.SSLInternalCertificateName(cr))
 	}
 
-	now := metav1.Now()
 	for _, name := range certNames {
 		cert := &cm.Certificate{}
 		if err := r.client.Get(ctx, types.NamespacedName{
@@ -432,40 +437,26 @@ func (r *ReconcilePerconaXtraDBCluster) reconcileCARotation(
 		}
 
 		// Check if already issuing to avoid redundant status updates.
-		alreadyIssuing := false
-		for _, c := range cert.Status.Conditions {
-			if c.Type == cm.CertificateConditionIssuing && c.Status == cmmeta.ConditionTrue {
-				alreadyIssuing = true
-				break
-			}
-		}
-		if alreadyIssuing {
+		if cmapiutil.CertificateHasCondition(cert, cm.CertificateCondition{
+			Type:   cm.CertificateConditionIssuing,
+			Status: cmmeta.ConditionTrue,
+		}) {
 			log.Info("Certificate already issuing, skipping", "certificate", name)
 			continue
 		}
 
 		log.Info("Triggering leaf certificate re-issuance", "certificate", name)
 
-		// Set the Issuing condition to True to trigger cert-manager re-issuance.
-		issuing := cm.CertificateCondition{
-			Type:               cm.CertificateConditionIssuing,
-			Status:             cmmeta.ConditionTrue,
-			Reason:             "ManuallyTriggered",
-			Message:            "Re-issuing due to CA rotation",
-			LastTransitionTime: &now,
-		}
-
-		found := false
-		for i, c := range cert.Status.Conditions {
-			if c.Type == cm.CertificateConditionIssuing {
-				cert.Status.Conditions[i] = issuing
-				found = true
-				break
-			}
-		}
-		if !found {
-			cert.Status.Conditions = append(cert.Status.Conditions, issuing)
-		}
+		// Set the Issuing condition to True to trigger cert-manager
+		// re-issuance, mirroring the behaviour of `cmctl renew`.
+		cmapiutil.SetCertificateCondition(
+			cert,
+			cert.Generation,
+			cm.CertificateConditionIssuing,
+			cmmeta.ConditionTrue,
+			"ManuallyTriggered",
+			"Re-issuing due to CA rotation",
+		)
 
 		if err := r.client.Status().Update(ctx, cert); err != nil {
 			return fmt.Errorf("update certificate status %s: %w", name, err)
