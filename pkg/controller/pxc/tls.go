@@ -57,11 +57,7 @@ func (r *ReconcilePerconaXtraDBCluster) reconcileSSL(ctx context.Context, cr *ap
 		}
 		// reconcile cert-manager Certificate specs on operator upgrade
 		if err := r.reconcileCertManagerCertificateSpecs(ctx, cr); err != nil {
-			if cr.Spec.TLS != nil && cr.Spec.TLS.IssuerConf != nil {
-				return fmt.Errorf("reconcile cert-manager certificates: %w", err)
-			}
-			log := logf.FromContext(ctx)
-			log.Info("Failed to reconcile cert-manager certificates, skipping (certs may be manually managed)", "error", err)
+			return fmt.Errorf("reconcile cert-manager certificates: %w", err)
 		}
 		return nil
 	} else if errSecret != nil && !k8serr.IsNotFound(errSecret) {
@@ -274,21 +270,49 @@ func (r *ReconcilePerconaXtraDBCluster) createOrUpdateCertificate(ctx context.Co
 		},
 	}
 	_, err := controllerutil.CreateOrUpdate(ctx, r.client, existing, func() error {
-		existing.Labels = desired.Labels
+		existing.Labels = mergeCertificateLabels(existing.Labels, desired.Labels)
 
 		// Preserve IssuerRef.Group if the API server defaulted it
 		// (cert-manager >= 1.19 defaults empty group to "cert-manager.io").
 		// Without this, every reconcile would see a diff and trigger
 		// an unnecessary Update, which increments the Certificate's
 		// generation and may cause cert-manager to re-issue.
-		if desired.Spec.IssuerRef.Group == "" && existing.Spec.IssuerRef.Group != "" {
-			desired.Spec.IssuerRef.Group = existing.Spec.IssuerRef.Group
+		desiredSpec := desired.Spec
+		if desiredSpec.PrivateKey != nil {
+			privateKey := *desiredSpec.PrivateKey
+			desiredSpec.PrivateKey = &privateKey
+		}
+		if desiredSpec.IssuerRef.Group == "" && existing.Spec.IssuerRef.Group != "" {
+			desiredSpec.IssuerRef.Group = existing.Spec.IssuerRef.Group
 		}
 
-		existing.Spec = desired.Spec
+		// A CA rotation is triggered by patching rotationPolicy=Always.
+		// Keep that explicit override instead of resetting it on the next reconcile.
+		if existing.Spec.PrivateKey != nil && desiredSpec.PrivateKey != nil &&
+			desiredSpec.PrivateKey.RotationPolicy == cm.RotationPolicyNever &&
+			existing.Spec.PrivateKey.RotationPolicy != "" &&
+			existing.Spec.PrivateKey.RotationPolicy != desiredSpec.PrivateKey.RotationPolicy {
+			desiredSpec.PrivateKey.RotationPolicy = existing.Spec.PrivateKey.RotationPolicy
+		}
+
+		existing.Spec = desiredSpec
 		return nil
 	})
 	return err
+}
+
+func mergeCertificateLabels(existing, desired map[string]string) map[string]string {
+	if len(existing) == 0 && len(desired) == 0 {
+		return nil
+	}
+	labels := make(map[string]string, len(existing)+len(desired))
+	for k, v := range existing {
+		labels[k] = v
+	}
+	for k, v := range desired {
+		labels[k] = v
+	}
+	return labels
 }
 
 // tlsCertConfig holds the resolved TLS configuration for building cert-manager Certificate objects.
