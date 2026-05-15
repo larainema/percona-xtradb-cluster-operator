@@ -270,28 +270,30 @@ func (r *ReconcilePerconaXtraDBCluster) createOrUpdateCertificate(ctx context.Co
 		},
 	}
 	_, err := controllerutil.CreateOrUpdate(ctx, r.client, existing, func() error {
-		existing.Labels = mergeCertificateLabels(existing.Labels, desired.Labels)
+		existing.Labels = mergeStringMap(existing.Labels, desired.Labels)
+		existing.Annotations = mergeStringMap(existing.Annotations, desired.Annotations)
+		if len(desired.OwnerReferences) > 0 {
+			existing.OwnerReferences = desired.OwnerReferences
+		}
+
+		desiredSpec := desired.Spec
+		if desiredSpec.PrivateKey != nil {
+			privateKey := *desiredSpec.PrivateKey
+			desiredSpec.PrivateKey = &privateKey
+		}
 
 		// Preserve IssuerRef.Group if the API server defaulted it
 		// (cert-manager >= 1.19 defaults empty group to "cert-manager.io").
 		// Without this, every reconcile would see a diff and trigger
 		// an unnecessary Update, which increments the Certificate's
 		// generation and may cause cert-manager to re-issue.
-		desiredSpec := desired.Spec
-		if desiredSpec.PrivateKey != nil {
-			privateKey := *desiredSpec.PrivateKey
-			desiredSpec.PrivateKey = &privateKey
-		}
 		if desiredSpec.IssuerRef.Group == "" && existing.Spec.IssuerRef.Group != "" {
 			desiredSpec.IssuerRef.Group = existing.Spec.IssuerRef.Group
 		}
 
-		// A CA rotation is triggered by patching rotationPolicy=Always.
-		// Keep that explicit override instead of resetting it on the next reconcile.
-		if existing.Spec.PrivateKey != nil && desiredSpec.PrivateKey != nil &&
-			desiredSpec.PrivateKey.RotationPolicy == cm.RotationPolicyNever &&
-			existing.Spec.PrivateKey.RotationPolicy != "" &&
-			existing.Spec.PrivateKey.RotationPolicy != desiredSpec.PrivateKey.RotationPolicy {
+		// CA rotation is triggered by patching rotationPolicy=Always.
+		// Keep the override only while cert-manager is actively issuing.
+		if shouldPreserveCertificateRotationPolicy(existing, desiredSpec) {
 			desiredSpec.PrivateKey.RotationPolicy = existing.Spec.PrivateKey.RotationPolicy
 		}
 
@@ -301,18 +303,41 @@ func (r *ReconcilePerconaXtraDBCluster) createOrUpdateCertificate(ctx context.Co
 	return err
 }
 
-func mergeCertificateLabels(existing, desired map[string]string) map[string]string {
+func mergeStringMap(existing, desired map[string]string) map[string]string {
 	if len(existing) == 0 && len(desired) == 0 {
 		return nil
 	}
-	labels := make(map[string]string, len(existing)+len(desired))
+	merged := make(map[string]string, len(existing)+len(desired))
 	for k, v := range existing {
-		labels[k] = v
+		merged[k] = v
 	}
 	for k, v := range desired {
-		labels[k] = v
+		merged[k] = v
 	}
-	return labels
+	return merged
+}
+
+func shouldPreserveCertificateRotationPolicy(existing *cm.Certificate, desired cm.CertificateSpec) bool {
+	if existing.Spec.PrivateKey == nil || desired.PrivateKey == nil {
+		return false
+	}
+	if desired.PrivateKey.RotationPolicy != cm.RotationPolicyNever {
+		return false
+	}
+	if existing.Spec.PrivateKey.RotationPolicy == "" ||
+		existing.Spec.PrivateKey.RotationPolicy == desired.PrivateKey.RotationPolicy {
+		return false
+	}
+	return certificateIsIssuing(existing)
+}
+
+func certificateIsIssuing(cert *cm.Certificate) bool {
+	for _, condition := range cert.Status.Conditions {
+		if condition.Type == cm.CertificateConditionIssuing && condition.Status == cmmeta.ConditionTrue {
+			return true
+		}
+	}
+	return false
 }
 
 // tlsCertConfig holds the resolved TLS configuration for building cert-manager Certificate objects.

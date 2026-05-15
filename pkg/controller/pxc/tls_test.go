@@ -36,6 +36,9 @@ func TestCreateOrUpdateCertificatePreservesExistingFields(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "cluster-ca-cert",
 			Namespace: "default",
+			Annotations: map[string]string{
+				"external": "keep",
+			},
 			Labels: map[string]string{
 				"external":               "keep",
 				"app.kubernetes.io/name": "old",
@@ -52,14 +55,33 @@ func TestCreateOrUpdateCertificatePreservesExistingFields(t *testing.T) {
 				RotationPolicy: cm.RotationPolicyAlways,
 			},
 		},
+		Status: cm.CertificateStatus{
+			Conditions: []cm.CertificateCondition{
+				{
+					Type:   cm.CertificateConditionIssuing,
+					Status: cmmeta.ConditionTrue,
+				},
+			},
+		},
 	}
 	desired := &cm.Certificate{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      existing.Name,
 			Namespace: existing.Namespace,
+			Annotations: map[string]string{
+				"desired": "true",
+			},
 			Labels: map[string]string{
 				"app.kubernetes.io/name": "pxc",
 				"desired":                "true",
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: api.SchemeGroupVersion.String(),
+					Kind:       "PerconaXtraDBCluster",
+					Name:       "cluster",
+					UID:        types.UID("cluster-uid"),
+				},
 			},
 		},
 		Spec: cm.CertificateSpec{
@@ -95,11 +117,28 @@ func TestCreateOrUpdateCertificatePreservesExistingFields(t *testing.T) {
 		"app.kubernetes.io/name": "pxc",
 		"desired":                "true",
 	}, actual.Labels)
+	require.Equal(t, map[string]string{
+		"external": "keep",
+		"desired":  "true",
+	}, actual.Annotations)
+	require.Equal(t, desired.OwnerReferences, actual.OwnerReferences)
 	require.Equal(t, "cert-manager.io", actual.Spec.IssuerRef.Group)
 	require.Equal(t, cm.RotationPolicyAlways, actual.Spec.PrivateKey.RotationPolicy)
 	require.Equal(t, "cluster-ca-cert", actual.Spec.SecretName)
 	require.Equal(t, "cluster-ca", actual.Spec.CommonName)
 	require.True(t, actual.Spec.IsCA)
+
+	actual.Status.Conditions = []cm.CertificateCondition{
+		{
+			Type:   cm.CertificateConditionIssuing,
+			Status: cmmeta.ConditionFalse,
+		},
+	}
+	require.NoError(t, cl.Update(ctx, actual))
+	require.NoError(t, r.createOrUpdateCertificate(ctx, desired))
+
+	require.NoError(t, cl.Get(ctx, client.ObjectKeyFromObject(existing), actual))
+	require.Equal(t, cm.RotationPolicyNever, actual.Spec.PrivateKey.RotationPolicy)
 }
 
 func TestRotateSSLCertificate(t *testing.T) {
