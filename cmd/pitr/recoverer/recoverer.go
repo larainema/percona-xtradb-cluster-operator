@@ -71,7 +71,7 @@ func (c Config) storages(ctx context.Context) (storage.Storage, storage.Storage,
 			return nil, nil, errors.Wrap(err, "read CA bundle file")
 		}
 
-		binlogStorage, err = storage.NewS3(ctx, c.BinlogStorageS3.Endpoint, c.BinlogStorageS3.AccessKeyID, c.BinlogStorageS3.AccessKey, c.BinlogStorageS3.SessionToken, bucket, prefix, c.BinlogStorageS3.Region, c.VerifyTLS, caBundle, c.BinlogStorageS3.ForcePath)
+		binlogStorage, err = storage.NewS3(ctx, c.BinlogStorageS3.Endpoint, c.BinlogStorageS3.AccessKeyID, c.BinlogStorageS3.AccessKey, c.BinlogStorageS3.SessionToken, bucket, prefix, c.BinlogStorageS3.Region, c.VerifyTLS, caBundle, c.BinlogStorageS3.ForcePath, c.BinlogStorageS3.SkipBucketExistsCheck)
 		if err != nil {
 			return nil, nil, errors.Wrap(err, "new s3 storage")
 		}
@@ -80,7 +80,7 @@ func (c Config) storages(ctx context.Context) (storage.Storage, storage.Storage,
 		if err != nil {
 			return nil, nil, errors.Wrap(err, "get bucket and prefix")
 		}
-		defaultStorage, err = storage.NewS3(ctx, c.BackupStorageS3.Endpoint, c.BackupStorageS3.AccessKeyID, c.BackupStorageS3.AccessKey, c.BackupStorageS3.SessionToken, bucket, prefix, c.BackupStorageS3.Region, c.VerifyTLS, caBundle, c.BackupStorageS3.ForcePath)
+		defaultStorage, err = storage.NewS3(ctx, c.BackupStorageS3.Endpoint, c.BackupStorageS3.AccessKeyID, c.BackupStorageS3.AccessKey, c.BackupStorageS3.SessionToken, bucket, prefix, c.BackupStorageS3.Region, c.VerifyTLS, caBundle, c.BackupStorageS3.ForcePath, c.BackupStorageS3.SkipBucketExistsCheck)
 		if err != nil {
 			return nil, nil, errors.Wrap(err, "new storage manager")
 		}
@@ -102,13 +102,14 @@ func (c Config) storages(ctx context.Context) (storage.Storage, storage.Storage,
 }
 
 type BackupS3 struct {
-	Endpoint     string `env:"ENDPOINT" envDefault:"s3.amazonaws.com"`
-	AccessKeyID  string `env:"ACCESS_KEY_ID,required"`
-	AccessKey    string `env:"SECRET_ACCESS_KEY,required"`
-	SessionToken string `env:"S3_SESSION_TOKEN"`
-	Region       string `env:"DEFAULT_REGION,required"`
-	BackupDest   string `env:"S3_BUCKET_URL,required"`
-	ForcePath    bool   `env:"S3_FORCE_PATH"`
+	Endpoint              string `env:"ENDPOINT" envDefault:"s3.amazonaws.com"`
+	AccessKeyID           string `env:"ACCESS_KEY_ID,required"`
+	AccessKey             string `env:"SECRET_ACCESS_KEY,required"`
+	SessionToken          string `env:"S3_SESSION_TOKEN"`
+	Region                string `env:"DEFAULT_REGION,required"`
+	BackupDest            string `env:"S3_BUCKET_URL,required"`
+	ForcePath             bool   `env:"S3_FORCE_PATH"`
+	SkipBucketExistsCheck bool   `env:"S3_SKIP_BUCKET_EXISTS_CHECK"`
 }
 
 type BackupAzure struct {
@@ -123,13 +124,14 @@ type BackupAzure struct {
 }
 
 type BinlogS3 struct {
-	Endpoint     string `env:"BINLOG_S3_ENDPOINT" envDefault:"s3.amazonaws.com"`
-	AccessKeyID  string `env:"BINLOG_ACCESS_KEY_ID,required"`
-	AccessKey    string `env:"BINLOG_SECRET_ACCESS_KEY,required"`
-	SessionToken string `env:"BINLOG_SESSION_TOKEN"`
-	Region       string `env:"BINLOG_S3_REGION,required"`
-	BucketURL    string `env:"BINLOG_S3_BUCKET_URL,required"`
-	ForcePath    bool   `env:"BINLOG_S3_FORCE_PATH"`
+	Endpoint              string `env:"BINLOG_S3_ENDPOINT" envDefault:"s3.amazonaws.com"`
+	AccessKeyID           string `env:"BINLOG_ACCESS_KEY_ID,required"`
+	AccessKey             string `env:"BINLOG_SECRET_ACCESS_KEY,required"`
+	SessionToken          string `env:"BINLOG_SESSION_TOKEN"`
+	Region                string `env:"BINLOG_S3_REGION,required"`
+	BucketURL             string `env:"BINLOG_S3_BUCKET_URL,required"`
+	ForcePath             bool   `env:"BINLOG_S3_FORCE_PATH"`
+	SkipBucketExistsCheck bool   `env:"BINLOG_S3_SKIP_BUCKET_EXISTS_CHECK"`
 }
 
 type BinlogAzure struct {
@@ -210,7 +212,7 @@ func validateTransactionGTID(targetGTID, startGTID string) error {
 		return errors.Wrap(err, "parse target GTID seqno")
 	}
 
-	for _, seg := range strings.Split(startGTID, ",") {
+	for seg := range strings.SplitSeq(startGTID, ",") {
 		seg = strings.TrimSpace(seg)
 		segParts := strings.SplitN(seg, ":", 2)
 		if len(segParts) != 2 || segParts[0] != targetUUID {
@@ -220,8 +222,8 @@ func validateTransactionGTID(targetGTID, startGTID string) error {
 		rangeStr := segParts[1]
 		rangeStr = rangeStr[strings.LastIndex(rangeStr, ":")+1:]
 		hi := rangeStr
-		if i := strings.Index(rangeStr, "-"); i >= 0 {
-			hi = rangeStr[i+1:]
+		if _, after, ok := strings.Cut(rangeStr, "-"); ok {
+			hi = after
 		}
 		hiInt, err := strconv.ParseInt(hi, 10, 64)
 		if err != nil {
@@ -511,7 +513,7 @@ func (r *Recoverer) setBinlogs(ctx context.Context) error {
 }
 
 func gtidSetContainsUUID(gtidSet, uuid string) bool {
-	for _, segment := range strings.Split(gtidSet, ",") {
+	for segment := range strings.SplitSeq(gtidSet, ",") {
 		segment = strings.TrimSpace(segment)
 		if strings.HasPrefix(segment, uuid+":") {
 			return true
@@ -610,11 +612,11 @@ func getStartGTIDSet(ctx context.Context, s storage.Storage) (string, error) {
 
 func getGTIDFromXtrabackup(content []byte) (string, error) {
 	sep := []byte("GTID of the last")
-	startIndex := bytes.Index(content, sep)
-	if startIndex == -1 {
+	_, after, ok := bytes.Cut(content, sep)
+	if !ok {
 		return "", errors.New("no gtid data in backup")
 	}
-	newOut := content[startIndex+len(sep):]
+	newOut := after
 	e := bytes.Index(newOut, []byte("'\n"))
 	if e == -1 {
 		return "", errors.New("can't find gtid data in backup")
@@ -708,14 +710,14 @@ func readBackupMeta(ctx context.Context, s storage.Storage) (*xbserver.BackupMet
 
 func parseGTIDFromSSTInfoContent(content []byte) (string, error) {
 	sep := []byte("galera-gtid=")
-	startIndex := bytes.Index(content, sep)
-	if startIndex == -1 {
+	_, after, ok := bytes.Cut(content, sep)
+	if !ok {
 		return "", errors.New("no gtid data in backup")
 	}
-	newOut := content[startIndex+len(sep):]
-	e := bytes.Index(newOut, []byte("\n"))
-	if e == -1 {
+	newOut := after
+	before, _, ok := bytes.Cut(newOut, []byte("\n"))
+	if !ok {
 		return "", errors.New("can't find gtid data in backup")
 	}
-	return string(newOut[:e]), nil
+	return string(before), nil
 }
