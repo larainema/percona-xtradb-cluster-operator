@@ -36,7 +36,7 @@ func (r *ReconcilePerconaXtraDBCluster) reconcilePersistentVolumes(ctx context.C
 	ls := naming.LabelsPXC(cr)
 	log := logf.FromContext(ctx).WithName("PVCResize").WithValues("sts", sts.Name)
 
-	if cr.Spec.VolumeExternalAutoscaling {
+	if cr.Spec.StorageScaling != nil && cr.Spec.StorageScaling.VolumeExternalAutoscaling {
 		log.V(1).Info("skipping volume autoscaling: external autoscaling is enabled")
 		return nil
 	}
@@ -260,17 +260,17 @@ func (r *ReconcilePerconaXtraDBCluster) reconcilePersistentVolumes(ctx context.C
 		return nil
 	}
 
-	if !cr.Spec.VolumeExpansionEnabled {
+	if !cr.Spec.IsVolumeExpansionEnabled() {
 		// If expansion is disabled we should keep the old value
 		cr.Spec.PXC.VolumeSpec.PersistentVolumeClaim.Resources.Requests[corev1.ResourceStorage] = configured
 		return nil
 	}
 
-	now := metav1.Now().Format(time.RFC3339)
-
-	err = k8s.AnnotateObject(ctx, r.client, cr, map[string]string{pxcv1.AnnotationPVCResizeInProgress: now})
-	if err != nil {
-		return errors.Wrap(err, "annotate pxc")
+	if !cr.PVCResizeInProgress() {
+		now := metav1.Now().Format(time.RFC3339)
+		if err := k8s.AnnotateObject(ctx, r.client, cr, map[string]string{pxcv1.AnnotationPVCResizeInProgress: now}); err != nil {
+			return errors.Wrap(err, "annotate pxc")
+		}
 	}
 
 	log.Info("Resizing PVCs", "requested", requested, "actual", actual, "pvcList", strings.Join(pvcsToUpdate, ","))
@@ -282,6 +282,12 @@ func (r *ReconcilePerconaXtraDBCluster) reconcilePersistentVolumes(ctx context.C
 
 		if pvc.Status.Capacity.Storage().Cmp(requested) >= 0 {
 			log.Info("PVC already resized", "name", pvc.Name, "actual", pvc.Status.Capacity.Storage(), "requested", requested)
+			continue
+		}
+
+		pvcRequested := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
+		if pvcRequested.Cmp(requested) == 0 {
+			log.Info("Waiting for PVC to resize", "name", pvc.Name, "actual", pvc.Status.Capacity.Storage(), "requested", requested)
 			continue
 		}
 
